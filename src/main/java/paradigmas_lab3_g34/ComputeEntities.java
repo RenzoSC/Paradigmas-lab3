@@ -25,11 +25,13 @@ import org.apache.spark.sql.SparkSession;
 import org.apache.spark.api.java.JavaSparkContext;
 import org.apache.spark.broadcast.Broadcast;
 
+import org.apache.spark.api.java.function.Function;
 
 public class ComputeEntities {
 
     public static void main(String[] args) {
 
+        //Obtener los Feeds.
         List<FeedsData> feedsDataArray = new ArrayList<>();
         try {
             feedsDataArray = JSONParser.parseJsonFeedsData("./src/main/java/data/feeds.json");
@@ -38,6 +40,7 @@ public class ComputeEntities {
             System.exit(1);
         }
 
+        //Obtener las Heuristicas.
         List<HeuristicData> heuristicDataArray = new ArrayList<>();
         try {
             heuristicDataArray = JSONParser.parseJsonHeuristicData("./src/main/java/data/heuristics.json");
@@ -53,12 +56,12 @@ public class ComputeEntities {
     }
 
     private static void run(Config config, List<FeedsData> feedsDataArray, List<HeuristicData> heuristicDataArray) {
-        superAssert(config, feedsDataArray, heuristicDataArray);
-        configPrintHelp(config, feedsDataArray, heuristicDataArray);
+        superAssert(config, feedsDataArray, heuristicDataArray);     //Chequea Errores de Input
+        configPrintHelp(config, feedsDataArray, heuristicDataArray); //Imprime las opciones de Ayuda en caso de que sean Solicitadas.
         List<Article> allArticles = new ArrayList<>();
-        allArticles = configProcessFeed(config, feedsDataArray);
-        configPrintFeed(config, allArticles);
-        configComputeNamedEntities(config, allArticles);
+        allArticles = configProcessFeed(config, feedsDataArray);     //Parsea el Feed y obtiene la Informacion de los Articulos.
+        configPrintFeed(config, allArticles);                        //Escribe la Informacion de los Articulos en bigdata.txt
+        configComputeNamedEntities(config, allArticles);             //Computa y Clasifica las Entidades Nombradas.
     }
 
     private static void superAssert(Config config, List<FeedsData> feedsDataArray, List<HeuristicData> heuristicDataArray){
@@ -134,7 +137,7 @@ public class ComputeEntities {
         SparkSession spark = SparkSession
         .builder()
         .appName("JavaComputeEntities")
-        .master("local[*]")
+        //.master("local[*]")
         .getOrCreate();
  
         JavaSparkContext jsc = new JavaSparkContext(spark.sparkContext());
@@ -184,12 +187,7 @@ public class ComputeEntities {
             
             //No se si las otras tambien se pueden hacer con Lambda, quedaria mas bonito. 
             JavaRDD<String> candidatesRDD = candidatesListRDD.flatMap(List::iterator);
-            /* 
-            // Imprimir todos los candidatos ---- para debuggeo
-            List<String> candidatesList = candidatesRDD.collect();
-            for (String candidate : candidatesList) {
-                System.out.println(candidate);
-            }*/
+
 
             //CLASIFICAR PALABRAS (3,4)
             JSONDict dict = new JSONDict("./src/main/java/data/dictionary.json");
@@ -203,38 +201,49 @@ public class ComputeEntities {
 
             JavaPairRDD<String, Integer> counts = ones.reduceByKey(Integer::sum);
 
-            final Broadcast<CategoryMap> categoryMapBroadcast = jsc.broadcast(categoryMap);
-            final Broadcast<TopicMap> topicMapBroadcast = jsc.broadcast(topicMap);
+            JavaRDD<Tuple2<String, Integer>> tupleRDD = counts.map(tuple -> new Tuple2<>(tuple._1(), tuple._2()));
 
-            counts.foreachPartition(iterator ->{
-                JSONDict dictLocal = dictBroadcast.value();
-                CategoryMap categoryMapLocal = categoryMapBroadcast.value();
-                TopicMap topicMapLocal = topicMapBroadcast.value();
-
-
-                iterator.forEachRemaining(pair->{
-                    for(int i = 0; i< dictLocal.getLength(); i++){
-                        List<String> keywords = dictLocal.getKeywords(i);
-    
-                        if(keywords.contains(pair._1())){
-                            String cat = dictLocal.getCategory(i);
-                            String label = dictLocal.getLabel(i);
-                            List<String> topics = dictLocal.getTopic(i);
-    
-                            for(int j =0; j<pair._2(); j++){
-                                categoryMapLocal.addEntity(topics, cat, label);
-                                topicMapLocal.addEntity(topics, label, cat);
-                            }
+            //Esta funcion es HORRIBLE... pero no se me ocurrio otra forma de hacerla.
+            JavaRDD<Tuple2< Tuple2< List<String>, Tuple2<String,String> >, Integer>> infoRDD = tupleRDD.map
+            (new Function<Tuple2<String, Integer>, Tuple2< Tuple2< List<String>, Tuple2<String,String> >, Integer>>() {
+                @Override
+                public Tuple2< Tuple2< List<String>, Tuple2<String,String> >, Integer> call(Tuple2<String, Integer> entidad) throws Exception {
+                    JSONDict dictLocal = dictBroadcast.value();
+                    String cat = "";
+                    String label = "";
+                    List<String> topics = new ArrayList<>();
+                    for (int i = 0; i < dictLocal.getLength(); i++) {
+                        List<String> keywords = dict.getKeywords(i);
+                        if(keywords.contains(entidad._1())){
+                            cat = dictLocal.getCategory(i);
+                            label = dictLocal.getLabel(i);
+                            topics = dictLocal.getTopic(i);
                         }
                     }
-                });
-            });
 
-            categoryMap = categoryMapBroadcast.value();
-            topicMap = topicMapBroadcast.value();
+                    return (new Tuple2<>(new Tuple2<>(topics, new Tuple2<>(cat, label)), entidad._2()));
+                }
+            });
+ 
+
+            //RECOLECTAR PALABRAS (5)
+            List<Tuple2< Tuple2< List<String>, Tuple2<String,String> >, Integer>> output = infoRDD.collect();
+
+            for (Tuple2<Tuple2< List<String>, Tuple2<String,String> >, Integer> tuple : output) {
+                
+                String cat = tuple._1()._2()._1();
+                String label = tuple._1()._2()._2();
+                List<String> topics = tuple._1()._1();
+
+                if (!topics.isEmpty() && cat.length() != 0 && label.length() != 0) {
+                    for (int j = 0; j < tuple._2(); j++){
+                        categoryMap.addEntity(topics, cat, label);
+                        topicMap.addEntity(topics, label, cat);
+                    }
+                }
+            }
 
             //IMPRIMIR PALABRAS (5)
-            //Esto creo que no Cambia.
             String statsFormat = config.getStatsFormat(); //obtenemos el tipo de stats que tenemos que printear
             System.out.println("\nStats: "+statsFormat);
             System.out.println("-".repeat(80));
